@@ -1,0 +1,11 @@
+{
+  "name": "calendly-notion-sync",
+  "version": "1.0.0",
+  "description": "Sync Calendly bookings to Notion Kandidaten database",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.14"
+  }
+}
