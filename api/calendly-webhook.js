@@ -1,7 +1,9 @@
 const { Client } = require('@notionhq/client');
 
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
-const DATABASE_ID = '42c178b0-55fd-42b1-b126-d9ad02dc3fba';
+
+// WICHTIG: Das ist die DATABASE ID, nicht die Data Source/Collection ID
+const DATABASE_ID = 'cf202b0ad8544bea8bd7f427efc6eedb';
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
