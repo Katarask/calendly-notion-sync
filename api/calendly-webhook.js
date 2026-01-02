@@ -1,100 +1,288 @@
 const { Client } = require('@notionhq/client');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// WICHTIG: Das ist die DATABASE ID, nicht die Data Source/Collection ID
 const DATABASE_ID = 'cf202b0ad8544bea8bd7f427efc6eedb';
+const APIFY_TOKEN = process.env.APIFY_API_KEY;
 
 module.exports = async (req, res) => {
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
   try {
-    const payload = req.body;
-    console.log('Received Calendly webhook:', JSON.stringify(payload, null, 2));
+    const { event, payload } = req.body;
 
-    if (payload.event !== 'invitee.created') {
-      return res.status(200).json({ message: 'Event ignored', event: payload.event });
+    // Only process invitee.created events
+    if (event !== 'invitee.created') {
+      return res.status(200).json({ message: 'Event ignored' });
     }
 
-    const inviteePayload = payload.payload;
-    const questionsAndAnswers = inviteePayload.questions_and_answers || [];
-    
-    const getAnswer = (position) => {
-      const qa = questionsAndAnswers[position - 1];
-      return qa ? qa.answer : '';
+    const { name, email, questions_and_answers } = payload;
+
+    // Extract answers from Calendly questions
+    const getAnswer = (questionKeyword) => {
+      const qa = questions_and_answers?.find(q => 
+        q.question?.toLowerCase().includes(questionKeyword.toLowerCase())
+      );
+      return qa?.answer || '';
     };
 
-    const name = inviteePayload.name || '';
-    const email = inviteePayload.email || '';
-    const position = getAnswer(1);
-    const kuendigungsfrist = getAnswer(2);
-    const gesuchteRegion = getAnswer(3);
-    const gehaltsvorstellung = getAnswer(4);
-    const beschaeftigungsverhaeltnis = getAnswer(5);
-    const arbeitszeit = getAnswer(6);
-    const homeOffice = getAnswer(7);
-    const vertragsform = getAnswer(8);
-    const linkedinUrl = getAnswer(9);
+    // Get LinkedIn URL from answers
+    const linkedinUrl = getAnswer('linkedin');
 
-    const properties = {
-      'Name': { title: [{ text: { content: name } }] },
-      'E-Mail': { email: email || null },
-      'Position': { rich_text: [{ text: { content: position } }] },
-      'Kündigungsfrist': { rich_text: [{ text: { content: kuendigungsfrist } }] },
-      'Gesuchte Region': { rich_text: [{ text: { content: gesuchteRegion } }] },
-      'Gehaltsvorstellung': { rich_text: [{ text: { content: gehaltsvorstellung } }] },
-      'Pipeline Status': { status: { name: 'Neu eingegangen' } }
-    };
-
-    // Multi-select: Beschäftigungsverhältnis
-    if (beschaeftigungsverhaeltnis) {
-      const validOptions = ['ANÜ', 'Festanstellung', 'Freelance'];
-      const selectedOptions = beschaeftigungsverhaeltnis.split(',').map(s => s.trim()).filter(s => validOptions.includes(s));
-      if (selectedOptions.length > 0) {
-        properties['Beschäftigungsverhältnis'] = { multi_select: selectedOptions.map(name => ({ name })) };
-      }
-    }
-
-    // Select: Arbeitszeit
-    if (arbeitszeit) {
-      const validOptions = ['Vollzeit', 'Teilzeit', 'Flexibel'];
-      const matched = validOptions.find(opt => arbeitszeit.toLowerCase().includes(opt.toLowerCase()));
-      if (matched) properties['Arbeitszeit'] = { select: { name: matched } };
-    }
-
-    // Select: Home-Office
-    if (homeOffice) {
-      const validOptions = ['Remote', 'Hybrid', 'Vor Ort', 'Flexibel'];
-      const matched = validOptions.find(opt => homeOffice.toLowerCase().includes(opt.toLowerCase()));
-      if (matched) properties['Home-Office'] = { select: { name: matched } };
-    }
-
-    // Multi-select: Vertragsform
-    if (vertragsform) {
-      const validOptions = ['Unbefristet', 'Befristet', 'Projektarbeit'];
-      const selectedOptions = vertragsform.split(',').map(s => s.trim()).filter(s => validOptions.includes(s));
-      if (selectedOptions.length > 0) {
-        properties['Vertragsform'] = { multi_select: selectedOptions.map(name => ({ name })) };
-      }
-    }
-
-    // URL: LinkedIn
-    if (linkedinUrl && linkedinUrl.includes('linkedin.com')) {
-      properties['LinkedIn URL'] = { url: linkedinUrl };
-    }
-
-    const response = await notion.pages.create({
+    // 1. Create Notion candidate entry
+    const notionPage = await notion.pages.create({
       parent: { database_id: DATABASE_ID },
-      properties: properties
+      properties: {
+        'Name': {
+          title: [{ text: { content: name || 'Unbekannt' } }]
+        },
+        'E-Mail': {
+          email: email || null
+        },
+        'Position': {
+          rich_text: [{ text: { content: getAnswer('position') } }]
+        },
+        'Kündigungsfrist': {
+          rich_text: [{ text: { content: getAnswer('kündigungsfrist') } }]
+        },
+        'Gesuchte Region': {
+          rich_text: [{ text: { content: getAnswer('region') } }]
+        },
+        'Gehaltsvorstellung': {
+          rich_text: [{ text: { content: getAnswer('gehalt') } }]
+        },
+        'LinkedIn URL': {
+          url: linkedinUrl || null
+        },
+        'Pipeline Status': {
+          status: { name: 'Erstgespräch' }
+        }
+      }
     });
 
-    console.log('Created Notion page:', response.id);
-    return res.status(200).json({ success: true, notionPageId: response.id, candidateName: name });
+    console.log('Notion page created:', notionPage.id);
+
+    // 2. If LinkedIn URL exists, start async enrichment
+    if (linkedinUrl) {
+      // Don't await - run in background
+      enrichWithLinkedIn(notionPage.id, linkedinUrl, name).catch(err => {
+        console.error('LinkedIn enrichment failed:', err);
+      });
+    }
+
+    return res.status(200).json({ 
+      success: true, 
+      notionPageId: notionPage.id,
+      linkedinEnrichment: linkedinUrl ? 'started' : 'skipped'
+    });
 
   } catch (error) {
-    console.error('Error processing webhook:', error);
-    return res.status(500).json({ error: 'Internal server error', message: error.message });
+    console.error('Webhook error:', error);
+    return res.status(500).json({ 
+      error: 'Internal server error', 
+      message: error.message 
+    });
   }
 };
+
+// Async function to enrich with LinkedIn data
+async function enrichWithLinkedIn(notionPageId, linkedinUrl, candidateName) {
+  try {
+    console.log('Starting LinkedIn scrape for:', linkedinUrl);
+
+    // 1. Run Apify LinkedIn scraper
+    const linkedinData = await scrapeLinkedIn(linkedinUrl);
+    
+    if (!linkedinData) {
+      console.log('No LinkedIn data returned');
+      return;
+    }
+
+    console.log('LinkedIn data received, generating briefing...');
+
+    // 2. Generate AI briefing with Claude
+    const briefing = await generateBriefing(linkedinData, candidateName);
+
+    // 3. Extract key information
+    const employers = extractEmployers(linkedinData);
+    const headline = linkedinData.headline || '';
+    const summary = linkedinData.summary || linkedinData.about || '';
+
+    // 4. Update Notion with enriched data
+    await notion.pages.update({
+      page_id: notionPageId,
+      properties: {
+        'Meeting Briefing': {
+          rich_text: [{ text: { content: briefing.substring(0, 2000) } }]
+        },
+        'Ehemalige Arbeitgeber': {
+          rich_text: [{ text: { content: employers.substring(0, 2000) } }]
+        },
+        'LinkedIn Headline': {
+          rich_text: [{ text: { content: headline.substring(0, 2000) } }]
+        },
+        'LinkedIn Summary': {
+          rich_text: [{ text: { content: summary.substring(0, 2000) } }]
+        }
+      }
+    });
+
+    console.log('Notion updated with LinkedIn enrichment');
+
+  } catch (error) {
+    console.error('LinkedIn enrichment error:', error);
+    throw error;
+  }
+}
+
+// Scrape LinkedIn profile using Apify
+async function scrapeLinkedIn(profileUrl) {
+  try {
+    // Start the actor run
+    const runResponse = await fetch(
+      `https://api.apify.com/v2/acts/apimaestro~linkedin-profile-detail/runs?token=${APIFY_TOKEN}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profileUrls: [profileUrl]
+        })
+      }
+    );
+
+    const runData = await runResponse.json();
+    const runId = runData.data?.id;
+
+    if (!runId) {
+      throw new Error('Failed to start Apify actor');
+    }
+
+    console.log('Apify run started:', runId);
+
+    // Wait for completion (poll every 5 seconds, max 2 minutes)
+    let attempts = 0;
+    const maxAttempts = 24;
+
+    while (attempts < maxAttempts) {
+      await sleep(5000);
+      
+      const statusResponse = await fetch(
+        `https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`
+      );
+      const statusData = await statusResponse.json();
+      
+      if (statusData.data?.status === 'SUCCEEDED') {
+        // Get results
+        const datasetId = statusData.data.defaultDatasetId;
+        const resultsResponse = await fetch(
+          `https://api.apify.com/v2/datasets/${datasetId}/items?token=${APIFY_TOKEN}`
+        );
+        const results = await resultsResponse.json();
+        
+        return results[0] || null;
+      }
+      
+      if (statusData.data?.status === 'FAILED' || statusData.data?.status === 'ABORTED') {
+        throw new Error(`Apify run failed: ${statusData.data?.status}`);
+      }
+      
+      attempts++;
+    }
+
+    throw new Error('Apify run timed out');
+
+  } catch (error) {
+    console.error('Apify scrape error:', error);
+    return null;
+  }
+}
+
+// Generate AI briefing with Claude
+async function generateBriefing(linkedinData, candidateName) {
+  try {
+    const prompt = `Du bist ein Recruiting-Assistent für einen Headhunter in der Defense & Aerospace Branche.
+
+Analysiere dieses LinkedIn-Profil und erstelle ein Briefing für das kommende Gespräch.
+
+KANDIDAT: ${candidateName}
+
+LINKEDIN DATEN:
+${JSON.stringify(linkedinData, null, 2)}
+
+Erstelle ein strukturiertes Briefing mit:
+
+## Kurzprofil
+(2-3 Sätze: Wer ist die Person, aktuelle Rolle, Erfahrungslevel)
+
+## Ehemalige Arbeitgeber & Projekte
+(Liste der relevanten Stationen mit Fokus auf Defense/Aerospace/Engineering)
+
+## Technische Skills
+(Relevante Technologien und Fachkenntnisse)
+
+## Gesprächsleitfaden
+- Einstiegsfragen
+- Wichtige Punkte zum Ansprechen
+- Mögliche Red Flags oder Highlights
+
+## Einschätzung
+(Kurze Bewertung: Passt der Kandidat typischerweise zu Defense/Aerospace Positionen?)
+
+Halte das Briefing prägnant und actionable - max. 1500 Zeichen.`;
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      messages: [
+        { role: 'user', content: prompt }
+      ]
+    });
+
+    return response.content[0]?.text || 'Briefing konnte nicht generiert werden.';
+
+  } catch (error) {
+    console.error('Claude API error:', error);
+    return `Briefing-Generierung fehlgeschlagen: ${error.message}`;
+  }
+}
+
+// Extract employers from LinkedIn data
+function extractEmployers(linkedinData) {
+  try {
+    const experiences = linkedinData.experience || linkedinData.positions || [];
+    
+    if (!Array.isArray(experiences) || experiences.length === 0) {
+      return 'Keine Arbeitgeber gefunden';
+    }
+
+    return experiences
+      .map(exp => {
+        const company = exp.companyName || exp.company || 'Unbekannt';
+        const title = exp.title || exp.position || '';
+        const duration = exp.duration || exp.dateRange || '';
+        return `• ${company}${title ? ` - ${title}` : ''}${duration ? ` (${duration})` : ''}`;
+      })
+      .slice(0, 10)
+      .join('\n');
+
+  } catch (error) {
+    return 'Fehler beim Extrahieren der Arbeitgeber';
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}

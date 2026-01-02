@@ -1,11 +1,13 @@
 {
   "name": "calendly-notion-sync",
-  "version": "1.0.0",
-  "description": "Sync Calendly bookings to Notion Kandidaten database",
-  "scripts": {
-    "dev": "vercel dev"
-  },
+  "version": "2.0.0",
+  "description": "Calendly to Notion sync with LinkedIn enrichment and AI briefing",
+  "main": "api/calendly-webhook.js",
   "dependencies": {
-    "@notionhq/client": "^2.2.14"
+    "@notionhq/client": "^2.2.14",
+    "@anthropic-ai/sdk": "^0.24.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
